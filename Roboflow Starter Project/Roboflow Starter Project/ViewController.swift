@@ -109,6 +109,23 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var debugViewVisible: Bool = true
     private var connectionButtons: [UIButton] = []
     
+    // Triangulation properties
+    private let triangulator = Triangulator()
+    private var lastDetectionTime: TimeInterval = 0
+    private var lastTriangulationTime: TimeInterval = 0
+    private var triangulationLabel: UILabel!
+    
+    // Calibration properties
+    private var calibrationMode: Bool = false
+    private var calibrationButton: UIButton!
+    private var calibrationInstructionsLabel: UILabel!
+    private var calibrationStepLabel: UILabel!
+    private var calibrationStep: Int = 0
+    private var calibrationPoints: [CGPoint] = []
+    
+    // New status indicator
+    private var statusIndicator: UIView?
+    
     override func viewDidLoad() {
         super.viewDidLoad()
         // Do any additional setup after loading the view. //roboflow-mask-wearing-ios
@@ -118,6 +135,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         
         // Setup MultipeerConnectivity
         setupMultipeerConnectivity()
+        
+        // Setup triangulation UI
+        setupTriangulationUI()
         
         // Setup a timer to update the transmission rate display
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
@@ -399,6 +419,13 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         // --- Step 1: find the "pickleball" bounding box (if it exists) ---
         var ballCenter: CGPoint? = nil
         
+        // Current time for this set of detections
+        let currentTime = CACurrentMediaTime()
+        lastDetectionTime = currentTime
+        
+        // Device identifier
+        let deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
+        
         for detection in detections {
             let detectionInfo = detection.vals()
             
@@ -412,6 +439,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 let color = detectionInfo["color"] as? [Int]
             else {
                 continue
+            }
+            
+            // Filter for ball/pickleball detections only
+            if !detectedClass.lowercased().contains("ball") {
+                continue // Skip non-ball objects
             }
             
             // Convert to CG values
@@ -437,15 +469,32 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                             detectedValue: detectedClass,
                             confidence: confidence)
             
-            // If you detect lines vs. balls:
-            // handle them differently as you wish:
-            if detectedClass == "ball" {
-                // We'll just track the first "pickleball"
-                // If you want multiple, store them in a dictionary keyed by ID or do matching.
-                let cX = boundingBox.midX
-                let cY = boundingBox.midY
-                ballCenter = CGPoint(x: cX, y: cY)
+            // Create a Detection2D object for triangulation
+            let detection2D = Detection2D(
+                x: Double(x),
+                y: Double(y),
+                width: Double(width),
+                height: Double(height),
+                confidence: confidence,
+                timestamp: currentTime,
+                deviceId: deviceId
+            )
+            
+            // Add to triangulator
+            let performedTriangulation = triangulator.addDetection(detection: detection2D)
+            
+            if performedTriangulation {
+                lastTriangulationTime = currentTime
+                updateTriangulationDisplay()
             }
+            
+            // Send detection to peers
+            sendDetectionToPeers(detection: detection2D)
+            
+            // Store the ball center for trajectory tracking
+            let cX = boundingBox.midX
+            let cY = boundingBox.midY
+            ballCenter = CGPoint(x: cX, y: cY)
         }
         
         // --- Step 2: update the ball trajectory ---
@@ -747,6 +796,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         toggleDebugButton.addTarget(self, action: #selector(toggleDebugView), for: .touchUpInside)
         view.addSubview(toggleDebugButton)
         
+        // Add calibration button
+        calibrationButton = UIButton(frame: CGRect(x: 20, y: view.bounds.height - 210, width: view.bounds.width - 40, height: 50))
+        calibrationButton.setTitle("Start Calibration", for: .normal)
+        calibrationButton.backgroundColor = .systemPurple
+        calibrationButton.layer.cornerRadius = 8
+        calibrationButton.addTarget(self, action: #selector(toggleCalibrationMode), for: .touchUpInside)
+        view.addSubview(calibrationButton)
+        
         // Add connection status label if it doesn't exist yet
         if connectionStatusLabel == nil {
             let statusLabel = UILabel(frame: CGRect(x: 20, y: 40, width: view.bounds.width - 40, height: 30))
@@ -836,6 +893,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         autoSendButton.addTarget(self, action: #selector(toggleAutoSend), for: .touchUpInside)
         view.addSubview(autoSendButton)
         connectionButtons.append(autoSendButton)
+        
+        // Add calibration button to connection buttons array
+        connectionButtons.append(calibrationButton)
     }
     
     @objc func startHosting() {
@@ -1076,6 +1136,68 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     func session(_ session: MCSession, didReceive data: Data, fromPeer peerID: MCPeerID) {
         // Process received data
         do {
+            if let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
+               let type = json["type"] as? String {
+                
+                switch type {
+                case "detection":
+                    if let detectionData = json["data"] as? [String: Any],
+                       let detection = Detection2D.fromDictionary(detectionData) {
+                        
+                        // Process the detection for triangulation
+                        let performedTriangulation = triangulator.addDetection(detection: detection)
+                        
+                        if performedTriangulation {
+                            DispatchQueue.main.async {
+                                self.lastTriangulationTime = CACurrentMediaTime()
+                                self.updateTriangulationDisplay()
+                            }
+                        }
+                    }
+                    
+                case "calibration":
+                    if let deviceId = json["device_id"] as? String,
+                       let intrinsicsDict = json["intrinsics"] as? [String: Any],
+                       let extrinsicsDict = json["extrinsics"] as? [String: Any] {
+                        
+                        // Create calibrator from received data
+                        let calibrator = CameraCalibrator()
+                        
+                        // Set intrinsics and extrinsics from dictionaries
+                        if let intrinsics = CameraIntrinsics.fromDictionary(intrinsicsDict) {
+                            calibrator.setIntrinsics(intrinsics)
+                        }
+                        
+                        if let extrinsics = CameraExtrinsics.fromDictionary(extrinsicsDict) {
+                            calibrator.setExtrinsics(extrinsics)
+                        }
+                        
+                        // Add to triangulator
+                        triangulator.addCalibrator(calibrator: calibrator, deviceId: deviceId)
+                        
+                        // Update UI
+                        DispatchQueue.main.async {
+                            self.updateConnectionStatus(status: "Received calibration from: \(peerID.displayName)")
+                        }
+                    }
+                    
+                default:
+                    // Handle legacy data format
+                    processReceivedData(data)
+                }
+            } else {
+                // Handle legacy data format
+                processReceivedData(data)
+            }
+        } catch {
+            print("Error processing received data: \(error.localizedDescription)")
+            processReceivedData(data)
+        }
+    }
+    
+    // Helper method to process received data in the original format
+    private func processReceivedData(_ data: Data) {
+        do {
             if let receivedPackets = try JSONSerialization.jsonObject(with: data) as? [[String: Any]],
                let packet = receivedPackets.first {
                 
@@ -1243,7 +1365,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
     
     @objc func toggleDebugView() {
-        debugViewVisible.toggle()
+        debugViewVisible = !debugViewVisible
         
         // Update button title
         if debugViewVisible {
@@ -1257,30 +1379,288 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         transmissionRateLabel.isHidden = !debugViewVisible
         jitterLabel.isHidden = !debugViewVisible
         debugDataLabel.isHidden = !debugViewVisible
+        triangulationLabel.isHidden = !debugViewVisible
         
         // Toggle visibility of connection buttons
         connectionButtons.forEach { $0.isHidden = !debugViewVisible }
         
+        // Toggle visibility of calibration button (but not the calibration UI if in calibration mode)
+        calibrationButton.isHidden = !debugViewVisible
+        if !calibrationMode {
+            calibrationInstructionsLabel.isHidden = true
+            calibrationStepLabel.isHidden = true
+        }
+        
         // When debug view is hidden, show a small connection status indicator
         if !debugViewVisible {
             // Create a small indicator next to the toggle button
-            let statusIndicator = UIView(frame: CGRect(x: view.bounds.width - 100, y: 65, width: 10, height: 10))
-            statusIndicator.layer.cornerRadius = 5
-            statusIndicator.tag = 999 // Use tag to find and remove it later
+            statusIndicator = UIView(frame: CGRect(x: view.bounds.width - 100, y: 65, width: 10, height: 10))
+            statusIndicator?.layer.cornerRadius = 5
+            statusIndicator?.tag = 999 // Use tag to find and remove it later
             
             // Set color based on connection status
             if mcSession.connectedPeers.isEmpty {
-                statusIndicator.backgroundColor = .red // Not connected
+                statusIndicator?.backgroundColor = .red // Not connected
             } else {
-                statusIndicator.backgroundColor = .green // Connected
+                statusIndicator?.backgroundColor = .green // Connected
             }
             
-            view.addSubview(statusIndicator)
+            view.addSubview(statusIndicator!)
         } else {
             // Remove the indicator when debug view is shown
-            if let indicator = view.viewWithTag(999) {
-                indicator.removeFromSuperview()
+            statusIndicator?.removeFromSuperview()
+            statusIndicator = nil
+        }
+    }
+    
+    private func setupTriangulationUI() {
+        // Create triangulation position label
+        triangulationLabel = UILabel()
+        triangulationLabel.frame = CGRect(x: 20, y: 200, width: view.bounds.width - 40, height: 60)
+        triangulationLabel.textColor = .white
+        triangulationLabel.backgroundColor = UIColor.black.withAlphaComponent(0.5)
+        triangulationLabel.numberOfLines = 3
+        triangulationLabel.textAlignment = .left
+        triangulationLabel.font = UIFont.systemFont(ofSize: 12)
+        triangulationLabel.layer.cornerRadius = 5
+        triangulationLabel.clipsToBounds = true
+        triangulationLabel.text = "Waiting for triangulation data..."
+        triangulationLabel.isHidden = !debugViewVisible
+        view.addSubview(triangulationLabel)
+        
+        // Add calibration instructions label
+        calibrationInstructionsLabel = UILabel(frame: CGRect(x: 20, y: 270, width: view.bounds.width - 40, height: 80))
+        calibrationInstructionsLabel.textColor = .white
+        calibrationInstructionsLabel.backgroundColor = UIColor.black.withAlphaComponent(0.5)
+        calibrationInstructionsLabel.numberOfLines = 4
+        calibrationInstructionsLabel.textAlignment = .center
+        calibrationInstructionsLabel.font = UIFont.systemFont(ofSize: 14)
+        calibrationInstructionsLabel.layer.cornerRadius = 5
+        calibrationInstructionsLabel.clipsToBounds = true
+        calibrationInstructionsLabel.text = "Calibration will help establish the relative positions of the devices."
+        calibrationInstructionsLabel.isHidden = true
+        view.addSubview(calibrationInstructionsLabel)
+        
+        // Add calibration step label
+        calibrationStepLabel = UILabel(frame: CGRect(x: 20, y: 360, width: view.bounds.width - 40, height: 40))
+        calibrationStepLabel.textColor = .white
+        calibrationStepLabel.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.7)
+        calibrationStepLabel.numberOfLines = 2
+        calibrationStepLabel.textAlignment = .center
+        calibrationStepLabel.font = UIFont.boldSystemFont(ofSize: 16)
+        calibrationStepLabel.layer.cornerRadius = 5
+        calibrationStepLabel.clipsToBounds = true
+        calibrationStepLabel.text = "Step 1: Place calibration object"
+        calibrationStepLabel.isHidden = true
+        view.addSubview(calibrationStepLabel)
+    }
+    
+    // MARK: - Calibration Methods
+    
+    @objc func toggleCalibrationMode() {
+        calibrationMode = !calibrationMode
+        
+        if calibrationMode {
+            // Start calibration
+            calibrationButton.setTitle("Cancel Calibration", for: .normal)
+            calibrationButton.backgroundColor = .systemRed
+            
+            // Show calibration UI
+            calibrationInstructionsLabel.isHidden = false
+            calibrationStepLabel.isHidden = false
+            
+            // Reset calibration state
+            calibrationStep = 1
+            calibrationPoints.removeAll()
+            
+            // Update instructions
+            updateCalibrationInstructions()
+            
+            // Add tap gesture recognizer for calibration points
+            let tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleCalibrationTap(_:)))
+            view.addGestureRecognizer(tapGesture)
+            
+        } else {
+            // End calibration
+            calibrationButton.setTitle("Start Calibration", for: .normal)
+            calibrationButton.backgroundColor = .systemPurple
+            
+            // Hide calibration UI
+            calibrationInstructionsLabel.isHidden = true
+            calibrationStepLabel.isHidden = true
+            
+            // Remove tap gesture recognizer
+            for recognizer in view.gestureRecognizers ?? [] {
+                if let tapGesture = recognizer as? UITapGestureRecognizer,
+                   tapGesture.action == #selector(handleCalibrationTap(_:)) {
+                    view.removeGestureRecognizer(tapGesture)
+                }
             }
+        }
+    }
+    
+    private func updateCalibrationInstructions() {
+        switch calibrationStep {
+        case 1:
+            calibrationStepLabel.text = "Step 1: Tap on the top-left corner of the calibration object"
+            calibrationInstructionsLabel.text = "Place a rectangular calibration object (e.g., a sheet of paper) in view of both cameras."
+        case 2:
+            calibrationStepLabel.text = "Step 2: Tap on the top-right corner of the calibration object"
+            calibrationInstructionsLabel.text = "Make sure the object is clearly visible and not moving."
+        case 3:
+            calibrationStepLabel.text = "Step 3: Tap on the bottom-right corner of the calibration object"
+            calibrationInstructionsLabel.text = "Keep the device steady during calibration."
+        case 4:
+            calibrationStepLabel.text = "Step 4: Tap on the bottom-left corner of the calibration object"
+            calibrationInstructionsLabel.text = "Almost done! This is the last corner to tap."
+        case 5:
+            calibrationStepLabel.text = "Calibration Complete!"
+            calibrationInstructionsLabel.text = "Calibration data has been saved and shared with the other device."
+            
+            // Perform the actual calibration
+            performCalibration()
+            
+            // Auto-exit calibration mode after a delay
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                self.toggleCalibrationMode()
+            }
+        default:
+            break
+        }
+    }
+    
+    @objc func handleCalibrationTap(_ gesture: UITapGestureRecognizer) {
+        guard calibrationMode && calibrationStep <= 4 else { return }
+        
+        // Get the tap location
+        let location = gesture.location(in: previewLayer)
+        
+        // Store the calibration point
+        calibrationPoints.append(location)
+        
+        // Draw a marker at the tapped location
+        drawCalibrationMarker(at: location)
+        
+        // Move to the next step
+        calibrationStep += 1
+        updateCalibrationInstructions()
+    }
+    
+    private func drawCalibrationMarker(at point: CGPoint) {
+        // Create a marker view
+        let markerSize: CGFloat = 20
+        let markerView = UIView(frame: CGRect(x: point.x - markerSize/2, y: point.y - markerSize/2, width: markerSize, height: markerSize))
+        markerView.backgroundColor = .systemYellow
+        markerView.layer.cornerRadius = markerSize/2
+        markerView.alpha = 0.7
+        markerView.tag = 1000 + calibrationPoints.count // Use tag to identify markers
+        
+        // Add a label with the point number
+        let label = UILabel(frame: markerView.bounds)
+        label.text = "\(calibrationPoints.count)"
+        label.textAlignment = .center
+        label.textColor = .black
+        label.font = UIFont.boldSystemFont(ofSize: 12)
+        markerView.addSubview(label)
+        
+        // Add to the view
+        view.addSubview(markerView)
+        
+        // Animate the marker to confirm the tap
+        UIView.animate(withDuration: 0.2, animations: {
+            markerView.transform = CGAffineTransform(scaleX: 1.5, y: 1.5)
+        }) { _ in
+            UIView.animate(withDuration: 0.2) {
+                markerView.transform = .identity
+            }
+        }
+    }
+    
+    private func performCalibration() {
+        guard calibrationPoints.count == 4 else { return }
+        
+        // Convert screen points to normalized image coordinates
+        let imagePoints = calibrationPoints.map { point -> CGPoint in
+            // Convert from screen coordinates to normalized image coordinates (0-1)
+            let normalizedX = point.x / previewLayer.bounds.width
+            let normalizedY = point.y / previewLayer.bounds.height
+            return CGPoint(x: normalizedX, y: normalizedY)
+        }
+        
+        // Create a simple calibration based on the points
+        // In a real implementation, this would use more sophisticated algorithms
+        let deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
+        
+        // Create a calibrator with default intrinsics
+        let calibrator = CameraCalibrator()
+        
+        // Set a simple extrinsic calibration (position and orientation)
+        // For this prototype, we'll just use a simple approach where:
+        // - First device is at origin (0,0,0)
+        // - Second device is at a fixed distance (e.g., 1 meter to the right)
+        let isFirstDevice = mcSession.connectedPeers.isEmpty || 
+                           (mcSession.connectedPeers.first?.displayName ?? "") > UIDevice.current.name
+        
+        if isFirstDevice {
+            // First device is at origin
+            calibrator.setExtrinsics(translation: [0, 0, 0], rotation: [0, 0, 0])
+        } else {
+            // Second device is 1 meter to the right
+            calibrator.setExtrinsics(translation: [1.0, 0, 0], rotation: [0, 0, 0])
+        }
+        
+        // Add the calibrator to the triangulator
+        triangulator.addCalibrator(calibrator: calibrator, deviceId: deviceId)
+        
+        // Share calibration data with peers
+        shareCalibrationData(calibrator: calibrator, deviceId: deviceId)
+    }
+    
+    private func shareCalibrationData(calibrator: CameraCalibrator, deviceId: String) {
+        guard !mcSession.connectedPeers.isEmpty else { return }
+        
+        do {
+            // Convert calibration data to dictionary
+            let intrinsicsDict = calibrator.intrinsics.toDictionary()
+            let extrinsicsDict = calibrator.extrinsics.toDictionary()
+            
+            let calibrationData: [String: Any] = [
+                "type": "calibration",
+                "device_id": deviceId,
+                "intrinsics": intrinsicsDict,
+                "extrinsics": extrinsicsDict
+            ]
+            
+            // Send to peers
+            let data = try JSONSerialization.data(withJSONObject: calibrationData, options: [])
+            try mcSession.send(data, toPeers: mcSession.connectedPeers, with: .reliable)
+            
+        } catch {
+            print("Error sending calibration data: \(error.localizedDescription)")
+        }
+    }
+    
+    // MARK: - Triangulation Methods
+    
+    private func sendDetectionToPeers(detection: Detection2D) {
+        guard !mcSession.connectedPeers.isEmpty else { return }
+        
+        do {
+            let detectionDict = detection.toDictionary()
+            let data = try JSONSerialization.data(withJSONObject: ["type": "detection", "data": detectionDict], options: [])
+            try mcSession.send(data, toPeers: mcSession.connectedPeers, with: .reliable)
+        } catch {
+            print("Error sending detection data: \(error.localizedDescription)")
+        }
+    }
+    
+    private func updateTriangulationDisplay() {
+        guard let position = triangulator.getLatestPosition() else { return }
+        
+        // Update UI on main thread
+        DispatchQueue.main.async {
+            self.triangulationLabel.text = String(format: "Ball Position (m):\nX: %.2f Y: %.2f Z: %.2f\nConfidence: %.2f", 
+                                                 position.x, position.y, position.z, position.confidence)
         }
     }
 }
