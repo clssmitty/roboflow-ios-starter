@@ -85,6 +85,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     
     // Timer for automatic sending of detection data
     private var autoSendTimer: Timer?
+    private var displayLink: CADisplayLink?
+    private var targetTransmissionInterval: TimeInterval = 1.0 / 60.0 // 60fps
+    private var lastScheduledTransmissionTime: CFTimeInterval = 0
     
     // Debug data for transmission statistics
     private var transmissionCount: Int = 0
@@ -92,10 +95,19 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var transmissionRate: Double = 0
     private var lastTransmissionSize: Int = 0
     private var rawTransmissionData: String = ""
+    private var jitterValues: [Double] = []
+    private var averageJitter: Double = 0
     
+    // UI Elements
     @IBOutlet weak var connectionStatusLabel: UILabel!
     private var debugDataLabel: UILabel!
     private var transmissionRateLabel: UILabel!
+    private var jitterLabel: UILabel!
+    private var toggleDebugButton: UIButton!
+    
+    // UI Visibility control
+    private var debugViewVisible: Bool = true
+    private var connectionButtons: [UIButton] = []
     
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -119,6 +131,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         // Clean up MultipeerConnectivity
         autoSendTimer?.invalidate()
         autoSendTimer = nil
+        
+        // Clean up display link
+        displayLink?.invalidate()
+        displayLink = nil
         
         mcAdvertiser.stopAdvertisingPeer()
         mcBrowser.stopBrowsingForPeers()
@@ -722,6 +738,15 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         mcBrowser = MCNearbyServiceBrowser(peer: myPeerId, serviceType: serviceType)
         mcBrowser.delegate = self
         
+        // Add toggle debug button
+        toggleDebugButton = UIButton(frame: CGRect(x: view.bounds.width - 90, y: 50, width: 80, height: 40))
+        toggleDebugButton.setTitle("Hide UI", for: .normal)
+        toggleDebugButton.backgroundColor = .systemBlue
+        toggleDebugButton.layer.cornerRadius = 8
+        toggleDebugButton.titleLabel?.font = UIFont.systemFont(ofSize: 14, weight: .medium)
+        toggleDebugButton.addTarget(self, action: #selector(toggleDebugView), for: .touchUpInside)
+        view.addSubview(toggleDebugButton)
+        
         // Add connection status label if it doesn't exist yet
         if connectionStatusLabel == nil {
             let statusLabel = UILabel(frame: CGRect(x: 20, y: 40, width: view.bounds.width - 40, height: 30))
@@ -745,8 +770,18 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         transmissionRateLabel.text = "Transmission Rate: 0 Hz"
         view.addSubview(transmissionRateLabel)
         
+        // Add jitter label
+        jitterLabel = UILabel(frame: CGRect(x: 20, y: 120, width: view.bounds.width - 40, height: 30))
+        jitterLabel.textAlignment = .center
+        jitterLabel.textColor = .white
+        jitterLabel.backgroundColor = UIColor.black.withAlphaComponent(0.5)
+        jitterLabel.layer.cornerRadius = 8
+        jitterLabel.clipsToBounds = true
+        jitterLabel.text = "Jitter: 0 ms"
+        view.addSubview(jitterLabel)
+        
         // Add debug data label
-        debugDataLabel = UILabel(frame: CGRect(x: 20, y: 120, width: view.bounds.width - 40, height: 60))
+        debugDataLabel = UILabel(frame: CGRect(x: 20, y: 160, width: view.bounds.width - 40, height: 60))
         debugDataLabel.textAlignment = .left
         debugDataLabel.textColor = .white
         debugDataLabel.backgroundColor = UIColor.black.withAlphaComponent(0.5)
@@ -762,6 +797,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
     
     func addConnectionButtons() {
+        // Clear any existing buttons
+        connectionButtons.forEach { $0.removeFromSuperview() }
+        connectionButtons.removeAll()
+        
         // Host button
         let hostButton = UIButton(frame: CGRect(x: 20, y: view.bounds.height - 150, width: view.bounds.width/2 - 30, height: 50))
         hostButton.setTitle("Host", for: .normal)
@@ -769,6 +808,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         hostButton.layer.cornerRadius = 8
         hostButton.addTarget(self, action: #selector(startHosting), for: .touchUpInside)
         view.addSubview(hostButton)
+        connectionButtons.append(hostButton)
         
         // Join button
         let joinButton = UIButton(frame: CGRect(x: view.bounds.width/2 + 10, y: view.bounds.height - 150, width: view.bounds.width/2 - 30, height: 50))
@@ -777,6 +817,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         joinButton.layer.cornerRadius = 8
         joinButton.addTarget(self, action: #selector(joinSession), for: .touchUpInside)
         view.addSubview(joinButton)
+        connectionButtons.append(joinButton)
         
         // Send Data button
         let sendButton = UIButton(frame: CGRect(x: 20, y: view.bounds.height - 90, width: view.bounds.width - 40, height: 50))
@@ -785,6 +826,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         sendButton.layer.cornerRadius = 8
         sendButton.addTarget(self, action: #selector(sendDetectionData), for: .touchUpInside)
         view.addSubview(sendButton)
+        connectionButtons.append(sendButton)
         
         // Auto-send toggle button
         let autoSendButton = UIButton(frame: CGRect(x: 20, y: view.bounds.height - 30, width: view.bounds.width - 40, height: 30))
@@ -793,6 +835,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         autoSendButton.layer.cornerRadius = 8
         autoSendButton.addTarget(self, action: #selector(toggleAutoSend), for: .touchUpInside)
         view.addSubview(autoSendButton)
+        connectionButtons.append(autoSendButton)
     }
     
     @objc func startHosting() {
@@ -816,7 +859,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         // Create a simple message with the latest detection data
         if let detections = getLatestDetections() {
             do {
-                let data = try JSONSerialization.data(withJSONObject: detections, options: [.fragmentsAllowed])
+                // Use compact JSON encoding for minimal size
+                let jsonOptions: JSONSerialization.WritingOptions = [.fragmentsAllowed, .sortedKeys, .withoutEscapingSlashes]
+                let data = try JSONSerialization.data(withJSONObject: detections, options: jsonOptions)
+                
+                // Use unreliable mode for lowest latency
                 try mcSession.send(data, toPeers: mcSession.connectedPeers, with: .unreliable)
                 
                 // Update transmission statistics
@@ -830,7 +877,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     if timeDiff > 0 {
                         // Calculate a moving average of the transmission rate
                         let instantRate = 1.0 / timeDiff
-                        transmissionRate = 0.8 * transmissionRate + 0.2 * instantRate
+                        transmissionRate = 0.9 * transmissionRate + 0.1 * instantRate // More weight on history for stability
                     }
                 }
                 lastTransmissionTime = now
@@ -840,8 +887,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     rawTransmissionData = String(jsonString.prefix(100)) + (jsonString.count > 100 ? "..." : "")
                 }
                 
-                // Update the UI
-                updateTransmissionRateDisplay()
+                // Update the UI (but not on every frame to avoid UI bottlenecks)
+                if transmissionCount % 10 == 0 {
+                    updateTransmissionRateDisplay()
+                }
                 
             } catch {
                 print("Error sending data: \(error.localizedDescription)")
@@ -856,71 +905,128 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             // Update transmission rate label
             self.transmissionRateLabel.text = String(format: "Rate: %.1f Hz | Size: %d bytes", self.transmissionRate, self.lastTransmissionSize)
             
+            // Update jitter label
+            self.jitterLabel.text = String(format: "Jitter: %.2f ms (target: 16.67ms)", self.averageJitter)
+            
             // Update debug data label
             self.debugDataLabel.text = "Count: \(self.transmissionCount)\nLast: \(self.lastTransmissionTime?.description.suffix(8) ?? "none")\nData: \(self.rawTransmissionData)"
         }
     }
     
     @objc func toggleAutoSend() {
-        if autoSendTimer == nil {
-            // Start auto-sending at approximately 30Hz (0.033 seconds)
-            autoSendTimer = Timer.scheduledTimer(withTimeInterval: 0.033, repeats: true) { [weak self] _ in
-                self?.sendDetectionData()
-            }
-            updateConnectionStatus(status: "Auto-send enabled (30Hz)")
+        if displayLink == nil {
+            // Start auto-sending at 60fps using CADisplayLink for precise timing
+            displayLink = CADisplayLink(target: self, selector: #selector(sendDataOnDisplayLink))
+            displayLink?.preferredFramesPerSecond = 60
+            displayLink?.add(to: .main, forMode: .common)
+            
+            // Reset statistics
+            transmissionCount = 0
+            lastTransmissionTime = nil
+            transmissionRate = 0
+            jitterValues = []
+            averageJitter = 0
+            lastScheduledTransmissionTime = 0
+            
+            updateConnectionStatus(status: "Auto-send enabled (60Hz)")
         } else {
             // Stop auto-sending
-            autoSendTimer?.invalidate()
-            autoSendTimer = nil
-            updateConnectionStatus(status: "Auto-send disabled")
+            displayLink?.invalidate()
+            displayLink = nil
             
             // Reset transmission statistics
             transmissionCount = 0
             lastTransmissionTime = nil
             transmissionRate = 0
+            jitterValues = []
+            averageJitter = 0
+            
+            updateConnectionStatus(status: "Auto-send disabled")
             updateTransmissionRateDisplay()
         }
     }
     
+    @objc func sendDataOnDisplayLink(displayLink: CADisplayLink) {
+        // Calculate time since last scheduled transmission
+        let currentTime = displayLink.timestamp
+        
+        // On first run, just initialize the time
+        if lastScheduledTransmissionTime == 0 {
+            lastScheduledTransmissionTime = currentTime
+            return
+        }
+        
+        // Calculate actual interval and jitter
+        let actualInterval = currentTime - lastScheduledTransmissionTime
+        let jitter = abs(actualInterval - targetTransmissionInterval) * 1000 // in milliseconds
+        
+        // Update jitter statistics (keep last 60 values - 1 second worth)
+        jitterValues.append(jitter)
+        if jitterValues.count > 60 {
+            jitterValues.removeFirst()
+        }
+        
+        // Calculate average jitter
+        if !jitterValues.isEmpty {
+            averageJitter = jitterValues.reduce(0, +) / Double(jitterValues.count)
+        }
+        
+        // Update the last scheduled time
+        lastScheduledTransmissionTime = currentTime
+        
+        // Send the data
+        sendDetectionData()
+    }
+    
     func getLatestDetections() -> [[String: Any]]? {
+        // Always create a data packet with timestamp, even if no detections
+        var packet: [String: Any] = [
+            "ts": Date().timeIntervalSince1970, // Timestamp for jitter calculation
+            "id": transmissionCount // Sequence number for packet loss detection
+        ]
+        
         // Convert the latest detection results to a serializable format with minimal data
         var serializableDetections: [[String: Any]] = []
         
-        for detection in latestDetectionResults {
-            // Only include essential data to minimize payload size
-            let detectionInfo = detection.vals()
-            var minimalDetection: [String: Any] = [:]
+        if !latestDetectionResults.isEmpty {
+            for detection in latestDetectionResults {
+                // Only include essential data to minimize payload size
+                let detectionInfo = detection.vals()
+                var minimalDetection: [String: Any] = [:]
+                
+                // Include only the essential fields
+                if let cls = detectionInfo["class"] as? String {
+                    minimalDetection["c"] = cls
+                }
+                if let confidence = detectionInfo["confidence"] as? Double {
+                    // Round confidence to 2 decimal places to reduce data size
+                    minimalDetection["cf"] = round(confidence * 100) / 100
+                }
+                if let x = detectionInfo["x"] as? Float {
+                    minimalDetection["x"] = Int(x)
+                }
+                if let y = detectionInfo["y"] as? Float {
+                    minimalDetection["y"] = Int(y)
+                }
+                if let width = detectionInfo["width"] as? Float {
+                    minimalDetection["w"] = Int(width)
+                }
+                if let height = detectionInfo["height"] as? Float {
+                    minimalDetection["h"] = Int(height)
+                }
+                
+                serializableDetections.append(minimalDetection)
+            }
             
-            // Include only the essential fields
-            if let cls = detectionInfo["class"] as? String {
-                minimalDetection["c"] = cls
-            }
-            if let confidence = detectionInfo["confidence"] as? Double {
-                // Round confidence to 2 decimal places to reduce data size
-                minimalDetection["cf"] = round(confidence * 100) / 100
-            }
-            if let x = detectionInfo["x"] as? Float {
-                minimalDetection["x"] = Int(x)
-            }
-            if let y = detectionInfo["y"] as? Float {
-                minimalDetection["y"] = Int(y)
-            }
-            if let width = detectionInfo["width"] as? Float {
-                minimalDetection["w"] = Int(width)
-            }
-            if let height = detectionInfo["height"] as? Float {
-                minimalDetection["h"] = Int(height)
-            }
-            
-            serializableDetections.append(minimalDetection)
+            // Add detections to the packet
+            packet["d"] = serializableDetections
+        } else {
+            // No detections available, send empty array
+            packet["d"] = []
         }
         
-        // If we have no detections, return nil or minimal sample data
-        if serializableDetections.isEmpty {
-            return nil
-        }
-        
-        return serializableDetections
+        // Return the packet as a single-element array to maintain compatibility
+        return [packet]
     }
     
     func updateConnectionStatus(status: String) {
@@ -942,38 +1048,66 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         case .connected:
             print("Connected to: \(peerID.displayName)")
             updateConnectionStatus(status: "Connected to: \(peerID.displayName)")
+            updateConnectionIndicator(connected: true)
         case .connecting:
             print("Connecting to: \(peerID.displayName)")
             updateConnectionStatus(status: "Connecting to: \(peerID.displayName)")
         case .notConnected:
             print("Not connected to: \(peerID.displayName)")
             updateConnectionStatus(status: "Disconnected from: \(peerID.displayName)")
+            updateConnectionIndicator(connected: false)
         @unknown default:
             print("Unknown connection state: \(peerID.displayName)")
+        }
+    }
+    
+    // Helper method to update the connection indicator
+    private func updateConnectionIndicator(connected: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, !self.debugViewVisible else { return }
+            
+            // Find and update the indicator if it exists
+            if let indicator = self.view.viewWithTag(999) {
+                indicator.backgroundColor = connected ? .green : .red
+            }
         }
     }
     
     func session(_ session: MCSession, didReceive data: Data, fromPeer peerID: MCPeerID) {
         // Process received data
         do {
-            if let receivedDetections = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
-                // Store the received detections
-                self.receivedDetections = receivedDetections
+            if let receivedPackets = try JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+               let packet = receivedPackets.first {
                 
-                // Update the UI to show we received data
-                DispatchQueue.main.async {
-                    // Show data size and content
-                    let dataSize = data.count
-                    var dataPreview = "No data"
-                    if let jsonString = String(data: data, encoding: .utf8) {
-                        dataPreview = String(jsonString.prefix(100)) + (jsonString.count > 100 ? "..." : "")
+                // Extract timestamp and calculate network latency
+                var latency: Double = 0
+                if let timestamp = packet["ts"] as? Double {
+                    latency = Date().timeIntervalSince1970 - timestamp
+                }
+                
+                // Extract sequence number to detect packet loss
+                let sequenceNumber = packet["id"] as? Int ?? 0
+                
+                // Extract detections
+                if let detections = packet["d"] as? [[String: Any]] {
+                    // Store the received detections
+                    self.receivedDetections = detections
+                    
+                    // Update the UI to show we received data
+                    DispatchQueue.main.async {
+                        // Show data size and content
+                        let dataSize = data.count
+                        var dataPreview = "No data"
+                        if let jsonString = String(data: data, encoding: .utf8) {
+                            dataPreview = String(jsonString.prefix(100)) + (jsonString.count > 100 ? "..." : "")
+                        }
+                        
+                        self.updateConnectionStatus(status: "Received #\(sequenceNumber) | Latency: \(String(format: "%.1f", latency * 1000))ms")
+                        self.debugDataLabel.text = "Received: \(dataSize) bytes\nFrom: \(peerID.displayName)\nData: \(dataPreview)"
+                        
+                        // Trigger redraw to show the received detections
+                        self.drawReceivedDetections()
                     }
-                    
-                    self.updateConnectionStatus(status: "Received \(dataSize) bytes from: \(peerID.displayName)")
-                    self.debugDataLabel.text = "Received: \(dataSize) bytes\nFrom: \(peerID.displayName)\nData: \(dataPreview)"
-                    
-                    // Trigger redraw to show the received detections
-                    self.drawReceivedDetections()
                 }
             }
         } catch {
@@ -1106,5 +1240,47 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     func browserViewControllerWasCancelled(_ browserViewController: MCBrowserViewController) {
         // Handle the cancellation of the browser view controller
         dismiss(animated: true, completion: nil)
+    }
+    
+    @objc func toggleDebugView() {
+        debugViewVisible.toggle()
+        
+        // Update button title
+        if debugViewVisible {
+            toggleDebugButton.setTitle("Hide UI", for: .normal)
+        } else {
+            toggleDebugButton.setTitle("Show UI", for: .normal)
+        }
+        
+        // Toggle visibility of debug elements
+        connectionStatusLabel.isHidden = !debugViewVisible
+        transmissionRateLabel.isHidden = !debugViewVisible
+        jitterLabel.isHidden = !debugViewVisible
+        debugDataLabel.isHidden = !debugViewVisible
+        
+        // Toggle visibility of connection buttons
+        connectionButtons.forEach { $0.isHidden = !debugViewVisible }
+        
+        // When debug view is hidden, show a small connection status indicator
+        if !debugViewVisible {
+            // Create a small indicator next to the toggle button
+            let statusIndicator = UIView(frame: CGRect(x: view.bounds.width - 100, y: 65, width: 10, height: 10))
+            statusIndicator.layer.cornerRadius = 5
+            statusIndicator.tag = 999 // Use tag to find and remove it later
+            
+            // Set color based on connection status
+            if mcSession.connectedPeers.isEmpty {
+                statusIndicator.backgroundColor = .red // Not connected
+            } else {
+                statusIndicator.backgroundColor = .green // Connected
+            }
+            
+            view.addSubview(statusIndicator)
+        } else {
+            // Remove the indicator when debug view is shown
+            if let indicator = view.viewWithTag(999) {
+                indicator.removeFromSuperview()
+            }
+        }
     }
 }
