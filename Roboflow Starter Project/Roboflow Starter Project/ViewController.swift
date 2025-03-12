@@ -106,6 +106,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         
         // Setup MultipeerConnectivity
         setupMultipeerConnectivity()
+        
+        // Setup a timer to update the transmission rate display
+        Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.updateTransmissionRateDisplay()
+        }
     }
     
     override func viewWillDisappear(_ animated: Bool) {
@@ -805,19 +810,54 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     @objc func sendDetectionData() {
         // Only send if we have peers connected
         guard !mcSession.connectedPeers.isEmpty else {
-            showAlert(title: "No Connections", message: "No peers connected to send data to.")
             return
         }
         
         // Create a simple message with the latest detection data
         if let detections = getLatestDetections() {
             do {
-                let data = try JSONSerialization.data(withJSONObject: detections, options: [])
-                try mcSession.send(data, toPeers: mcSession.connectedPeers, with: .reliable)
-                print("Sent detection data to \(mcSession.connectedPeers.count) peers")
+                let data = try JSONSerialization.data(withJSONObject: detections, options: [.fragmentsAllowed])
+                try mcSession.send(data, toPeers: mcSession.connectedPeers, with: .unreliable)
+                
+                // Update transmission statistics
+                transmissionCount += 1
+                lastTransmissionSize = data.count
+                
+                // Calculate transmission rate
+                let now = Date()
+                if let lastTime = lastTransmissionTime {
+                    let timeDiff = now.timeIntervalSince(lastTime)
+                    if timeDiff > 0 {
+                        // Calculate a moving average of the transmission rate
+                        let instantRate = 1.0 / timeDiff
+                        transmissionRate = 0.8 * transmissionRate + 0.2 * instantRate
+                    }
+                }
+                lastTransmissionTime = now
+                
+                // Update the raw data display (limit to a reasonable size)
+                if let jsonString = String(data: data, encoding: .utf8) {
+                    rawTransmissionData = String(jsonString.prefix(100)) + (jsonString.count > 100 ? "..." : "")
+                }
+                
+                // Update the UI
+                updateTransmissionRateDisplay()
+                
             } catch {
                 print("Error sending data: \(error.localizedDescription)")
             }
+        }
+    }
+    
+    func updateTransmissionRateDisplay() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            
+            // Update transmission rate label
+            self.transmissionRateLabel.text = String(format: "Rate: %.1f Hz | Size: %d bytes", self.transmissionRate, self.lastTransmissionSize)
+            
+            // Update debug data label
+            self.debugDataLabel.text = "Count: \(self.transmissionCount)\nLast: \(self.lastTransmissionTime?.description.suffix(8) ?? "none")\nData: \(self.rawTransmissionData)"
         }
     }
     
@@ -917,17 +957,22 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         // Process received data
         do {
             if let receivedDetections = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
-                print("Received detection data from \(peerID.displayName):")
-                for detection in receivedDetections {
-                    print(detection)
-                }
-                
                 // Store the received detections
                 self.receivedDetections = receivedDetections
                 
                 // Update the UI to show we received data
                 DispatchQueue.main.async {
-                    self.updateConnectionStatus(status: "Received data from: \(peerID.displayName)")
+                    // Show data size and content
+                    let dataSize = data.count
+                    var dataPreview = "No data"
+                    if let jsonString = String(data: data, encoding: .utf8) {
+                        dataPreview = String(jsonString.prefix(100)) + (jsonString.count > 100 ? "..." : "")
+                    }
+                    
+                    self.updateConnectionStatus(status: "Received \(dataSize) bytes from: \(peerID.displayName)")
+                    self.debugDataLabel.text = "Received: \(dataSize) bytes\nFrom: \(peerID.displayName)\nData: \(dataPreview)"
+                    
+                    // Trigger redraw to show the received detections
                     self.drawReceivedDetections()
                 }
             }
@@ -985,14 +1030,50 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let peerColor = UIColor(red: 1.0, green: 0.5, blue: 0.0, alpha: 0.4) // Orange
         
         for detection in receivedDetections {
-            guard
-                let detectedClass = detection["class"] as? String,
-                let confidence = detection["confidence"] as? Double,
-                let x = detection["x"] as? Float,
-                let y = detection["y"] as? Float,
-                let width = detection["width"] as? Float,
-                let height = detection["height"] as? Float
-            else {
+            // Handle both the minimized and original data formats
+            let detectedClass = detection["c"] as? String ?? detection["class"] as? String
+            let confidence = detection["cf"] as? Double ?? detection["confidence"] as? Double
+            
+            // Handle both Int and Float types for coordinates
+            var x: Float?
+            if let xInt = detection["x"] as? Int {
+                x = Float(xInt)
+            } else {
+                x = detection["x"] as? Float
+            }
+            
+            var y: Float?
+            if let yInt = detection["y"] as? Int {
+                y = Float(yInt)
+            } else {
+                y = detection["y"] as? Float
+            }
+            
+            var width: Float?
+            if let wInt = detection["w"] as? Int {
+                width = Float(wInt)
+            } else if let wInt = detection["width"] as? Int {
+                width = Float(wInt)
+            } else {
+                width = detection["width"] as? Float
+            }
+            
+            var height: Float?
+            if let hInt = detection["h"] as? Int {
+                height = Float(hInt)
+            } else if let hInt = detection["height"] as? Int {
+                height = Float(hInt)
+            } else {
+                height = detection["height"] as? Float
+            }
+            
+            // Make sure we have all required values
+            guard let cls = detectedClass,
+                  let conf = confidence,
+                  let xVal = x,
+                  let yVal = y,
+                  let widthVal = width,
+                  let heightVal = height else {
                 continue
             }
             
@@ -1001,17 +1082,17 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             let ys = bounds.height / bufferSize.height
             
             let boundingBox = CGRect(
-                x: CGFloat(x) * xs,
-                y: CGFloat(y) * ys,
-                width: CGFloat(width) * xs,
-                height: CGFloat(height) * ys
+                x: CGFloat(xVal) * xs,
+                y: CGFloat(yVal) * ys,
+                width: CGFloat(widthVal) * xs,
+                height: CGFloat(heightVal) * ys
             )
             
             // Draw the bounding box with a different color to indicate it's from a peer
             drawBoundingBox(boundingBox: boundingBox,
                             color: peerColor,
-                            detectedValue: "\(detectedClass) (peer)",
-                            confidence: confidence)
+                            detectedValue: "\(cls) (peer)",
+                            confidence: conf)
         }
     }
     
