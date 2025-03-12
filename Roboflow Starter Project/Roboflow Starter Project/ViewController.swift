@@ -40,7 +40,7 @@ extension Array where Element == CGPoint {
 }
 
 
-class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDelegate, MCSessionDelegate, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceBrowserDelegate {
+class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDelegate, MCSessionDelegate, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceBrowserDelegate, MCBrowserViewControllerDelegate {
     
     var bufferSize: CGSize = .zero
     var rootLayer: CALayer! = nil
@@ -86,7 +86,16 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     // Timer for automatic sending of detection data
     private var autoSendTimer: Timer?
     
+    // Debug data for transmission statistics
+    private var transmissionCount: Int = 0
+    private var lastTransmissionTime: Date?
+    private var transmissionRate: Double = 0
+    private var lastTransmissionSize: Int = 0
+    private var rawTransmissionData: String = ""
+    
     @IBOutlet weak var connectionStatusLabel: UILabel!
+    private var debugDataLabel: UILabel!
+    private var transmissionRateLabel: UILabel!
     
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -721,6 +730,28 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             connectionStatusLabel = statusLabel
         }
         
+        // Add transmission rate label
+        transmissionRateLabel = UILabel(frame: CGRect(x: 20, y: 80, width: view.bounds.width - 40, height: 30))
+        transmissionRateLabel.textAlignment = .center
+        transmissionRateLabel.textColor = .white
+        transmissionRateLabel.backgroundColor = UIColor.black.withAlphaComponent(0.5)
+        transmissionRateLabel.layer.cornerRadius = 8
+        transmissionRateLabel.clipsToBounds = true
+        transmissionRateLabel.text = "Transmission Rate: 0 Hz"
+        view.addSubview(transmissionRateLabel)
+        
+        // Add debug data label
+        debugDataLabel = UILabel(frame: CGRect(x: 20, y: 120, width: view.bounds.width - 40, height: 60))
+        debugDataLabel.textAlignment = .left
+        debugDataLabel.textColor = .white
+        debugDataLabel.backgroundColor = UIColor.black.withAlphaComponent(0.5)
+        debugDataLabel.layer.cornerRadius = 8
+        debugDataLabel.clipsToBounds = true
+        debugDataLabel.numberOfLines = 3
+        debugDataLabel.font = UIFont.systemFont(ofSize: 12)
+        debugDataLabel.text = "Data: None"
+        view.addSubview(debugDataLabel)
+        
         // Add connection buttons
         addConnectionButtons()
     }
@@ -767,7 +798,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     @objc func joinSession() {
         // Present browser view controller
         let mcBrowserVC = MCBrowserViewController(serviceType: serviceType, session: mcSession)
-        mcBrowserVC.delegate = self
+        mcBrowserVC.delegate = self as MCBrowserViewControllerDelegate
         present(mcBrowserVC, animated: true)
     }
     
@@ -792,35 +823,61 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     
     @objc func toggleAutoSend() {
         if autoSendTimer == nil {
-            // Start auto-sending
-            autoSendTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            // Start auto-sending at approximately 30Hz (0.033 seconds)
+            autoSendTimer = Timer.scheduledTimer(withTimeInterval: 0.033, repeats: true) { [weak self] _ in
                 self?.sendDetectionData()
             }
-            updateConnectionStatus(status: "Auto-send enabled")
+            updateConnectionStatus(status: "Auto-send enabled (30Hz)")
         } else {
             // Stop auto-sending
             autoSendTimer?.invalidate()
             autoSendTimer = nil
             updateConnectionStatus(status: "Auto-send disabled")
+            
+            // Reset transmission statistics
+            transmissionCount = 0
+            lastTransmissionTime = nil
+            transmissionRate = 0
+            updateTransmissionRateDisplay()
         }
     }
     
     func getLatestDetections() -> [[String: Any]]? {
-        // Convert the latest detection results to a serializable format
+        // Convert the latest detection results to a serializable format with minimal data
         var serializableDetections: [[String: Any]] = []
         
         for detection in latestDetectionResults {
-            if let detectionInfo = detection.vals() as? [String: Any] {
-                serializableDetections.append(detectionInfo)
+            // Only include essential data to minimize payload size
+            let detectionInfo = detection.vals()
+            var minimalDetection: [String: Any] = [:]
+            
+            // Include only the essential fields
+            if let cls = detectionInfo["class"] as? String {
+                minimalDetection["c"] = cls
             }
+            if let confidence = detectionInfo["confidence"] as? Double {
+                // Round confidence to 2 decimal places to reduce data size
+                minimalDetection["cf"] = round(confidence * 100) / 100
+            }
+            if let x = detectionInfo["x"] as? Float {
+                minimalDetection["x"] = Int(x)
+            }
+            if let y = detectionInfo["y"] as? Float {
+                minimalDetection["y"] = Int(y)
+            }
+            if let width = detectionInfo["width"] as? Float {
+                minimalDetection["w"] = Int(width)
+            }
+            if let height = detectionInfo["height"] as? Float {
+                minimalDetection["h"] = Int(height)
+            }
+            
+            serializableDetections.append(minimalDetection)
         }
         
-        // If we have no detections, return nil or sample data
+        // If we have no detections, return nil or minimal sample data
         if serializableDetections.isEmpty {
-            // Return nil or sample data for testing
-            return [
-                ["class": "sample", "confidence": 0.5, "x": 100, "y": 100, "width": 50, "height": 50]
-            ]
+            return nil
         }
         
         return serializableDetections
@@ -868,13 +925,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 // Store the received detections
                 self.receivedDetections = receivedDetections
                 
-                // Here you could process the received detections
-                // For example, display them on screen or combine with local detections
+                // Update the UI to show we received data
                 DispatchQueue.main.async {
-                    // Update the UI to show we received data
                     self.updateConnectionStatus(status: "Received data from: \(peerID.displayName)")
-                    
-                    // Redraw the detection overlay to include received detections
                     self.drawReceivedDetections()
                 }
             }
@@ -925,53 +978,52 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     func browser(_ browser: MCNearbyServiceBrowser, lostPeer peerID: MCPeerID) {
         print("Lost peer: \(peerID.displayName)")
     }
-}
-
-// MARK: - MCBrowserViewControllerDelegate
-extension ViewController: MCBrowserViewControllerDelegate {
+    
+    // Draw detections received from peers with a different color
+    func drawReceivedDetections() {
+        // Use a different color for received detections to distinguish them
+        let peerColor = UIColor(red: 1.0, green: 0.5, blue: 0.0, alpha: 0.4) // Orange
+        
+        for detection in receivedDetections {
+            guard
+                let detectedClass = detection["class"] as? String,
+                let confidence = detection["confidence"] as? Double,
+                let x = detection["x"] as? Float,
+                let y = detection["y"] as? Float,
+                let width = detection["width"] as? Float,
+                let height = detection["height"] as? Float
+            else {
+                continue
+            }
+            
+            let bounds = detectionOverlay.bounds
+            let xs = bounds.width / bufferSize.width
+            let ys = bounds.height / bufferSize.height
+            
+            let boundingBox = CGRect(
+                x: CGFloat(x) * xs,
+                y: CGFloat(y) * ys,
+                width: CGFloat(width) * xs,
+                height: CGFloat(height) * ys
+            )
+            
+            // Draw the bounding box with a different color to indicate it's from a peer
+            drawBoundingBox(boundingBox: boundingBox,
+                            color: peerColor,
+                            detectedValue: "\(detectedClass) (peer)",
+                            confidence: confidence)
+        }
+    }
+    
+    // MARK: - MCBrowserViewControllerDelegate
+    
     func browserViewControllerDidFinish(_ browserViewController: MCBrowserViewController) {
-        dismiss(animated: true)
-        updateConnectionStatus(status: "Connected to \(mcSession.connectedPeers.count) peers")
+        // Handle the completion of the browser view controller
+        dismiss(animated: true, completion: nil)
     }
     
     func browserViewControllerWasCancelled(_ browserViewController: MCBrowserViewController) {
-        dismiss(animated: true)
-        updateConnectionStatus(status: "Browsing cancelled")
-    }
-}
-
-// Draw detections received from peers with a different color
-func drawReceivedDetections() {
-    // Use a different color for received detections to distinguish them
-    let peerColor = UIColor(red: 1.0, green: 0.5, blue: 0.0, alpha: 0.4) // Orange
-    
-    for detection in receivedDetections {
-        guard
-            let detectedClass = detection["class"] as? String,
-            let confidence = detection["confidence"] as? Double,
-            let x = detection["x"] as? Float,
-            let y = detection["y"] as? Float,
-            let width = detection["width"] as? Float,
-            let height = detection["height"] as? Float
-        else {
-            continue
-        }
-        
-        let bounds = detectionOverlay.bounds
-        let xs = bounds.width / bufferSize.width
-        let ys = bounds.height / bufferSize.height
-        
-        let boundingBox = CGRect(
-            x: CGFloat(x) * xs,
-            y: CGFloat(y) * ys,
-            width: CGFloat(width) * xs,
-            height: CGFloat(height) * ys
-        )
-        
-        // Draw the bounding box with a special label to indicate it's from a peer
-        drawBoundingBox(boundingBox: boundingBox,
-                        color: peerColor,
-                        detectedValue: "\(detectedClass) (PEER)",
-                        confidence: confidence)
+        // Handle the cancellation of the browser view controller
+        dismiss(animated: true, completion: nil)
     }
 }
