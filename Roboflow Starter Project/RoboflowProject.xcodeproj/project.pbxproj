@@ -257,7 +257,7 @@
 					};
 				};
 			};
-			buildConfigurationList = E4B079CB28CE930C00A2237F /* Build configuration list for PBXProject "Roboflow Starter Project" */;
+			buildConfigurationList = E4B079CB28CE930C00A2237F /* Build configuration list for PBXProject "`" */;
 			compatibilityVersion = "Xcode 13.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -727,7 +727,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		E4B079CB28CE930C00A2237F /* Build configuration list for PBXProject "Roboflow Starter Project" */ = {
+		E4B079CB28CE930C00A2237F /* Build configuration list for PBXProject "`" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				E4B079F828CE931100A2237F /* Debug */,

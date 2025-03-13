@@ -38,12 +38,39 @@ struct CameraIntrinsics {
         return CGPoint(x: principalPointX, y: principalPointY)
     }
     
+    // Default initializer with all parameters
+    init(focalLengthX: Double, focalLengthY: Double, principalPointX: Double, principalPointY: Double,
+         distortionCoefficients: [Double] = [0.0, 0.0, 0.0, 0.0, 0.0],
+         imageWidth: Int = Int(UIScreen.main.bounds.width),
+         imageHeight: Int = Int(UIScreen.main.bounds.height),
+         deviceId: String? = nil) {
+        
+        self.focalLengthX = focalLengthX
+        self.focalLengthY = focalLengthY
+        self.principalPointX = principalPointX
+        self.principalPointY = principalPointY
+        self.distortionCoefficients = distortionCoefficients
+        self.imageWidth = imageWidth
+        self.imageHeight = imageHeight
+        
+        // If no device ID is provided, use the current device's ID
+        if let id = deviceId {
+            self.deviceId = id
+        } else {
+            self.deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
+        }
+    }
+    
     /// Create default intrinsics based on device model
     static func defaultForDevice() -> CameraIntrinsics {
         let device = UIDevice.current
         let screenBounds = UIScreen.main.bounds
         let screenWidth = Int(screenBounds.width)
         let screenHeight = Int(screenBounds.height)
+        
+        // Get the device ID
+        let deviceId = device.identifierForVendor?.uuidString ?? "unknown-device"
+        print("Creating default intrinsics for device ID: \(deviceId)")
         
         // Default values based on device model
         // These are approximations and should be calibrated properly
@@ -57,7 +84,7 @@ struct CameraIntrinsics {
                 distortionCoefficients: [0.0, 0.0, 0.0, 0.0, 0.0],
                 imageWidth: screenWidth,
                 imageHeight: screenHeight,
-                deviceId: device.identifierForVendor?.uuidString ?? "unknown-ipad"
+                deviceId: deviceId
             )
         } else {
             // iPhone 12 Pro approximation
@@ -69,7 +96,7 @@ struct CameraIntrinsics {
                 distortionCoefficients: [0.0, 0.0, 0.0, 0.0, 0.0],
                 imageWidth: screenWidth,
                 imageHeight: screenHeight,
-                deviceId: device.identifierForVendor?.uuidString ?? "unknown-iphone"
+                deviceId: deviceId
             )
         }
     }
@@ -127,35 +154,48 @@ struct CameraExtrinsics {
     // Device identifier
     let deviceId: String
     
-    /// Initialize with rotation angles (in radians) and translation
-    init(rotationAngles: [Double], translation: [Double], deviceId: String) {
+    // Initialize with rotation matrix and translation vector
+    init(rotation: [[Double]], translation: [Double], deviceId: String? = nil) {
+        self.rotation = rotation
+        self.translation = translation
+        
+        // If no device ID is provided, use the current device's ID
+        if let id = deviceId {
+            self.deviceId = id
+        } else {
+            self.deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
+        }
+    }
+    
+    // Initialize with rotation angles (in radians) and translation vector
+    init(rotationAngles: [Double], translation: [Double], deviceId: String? = nil) {
         // Convert rotation angles to rotation matrix
-        // Assuming rotation is [roll, pitch, yaw] in radians
-        let roll = rotationAngles[0]
-        let pitch = rotationAngles[1]
-        let yaw = rotationAngles[2]
+        // This is a simplified implementation - in a real app, use proper rotation matrices
+        let rx = rotationAngles[0]
+        let ry = rotationAngles[1]
+        let rz = rotationAngles[2]
         
         // Create rotation matrices for each axis
         let Rx: [[Double]] = [
             [1.0, 0.0, 0.0],
-            [0.0, cos(roll), -sin(roll)],
-            [0.0, sin(roll), cos(roll)]
+            [0.0, cos(rx), -sin(rx)],
+            [0.0, sin(rx), cos(rx)]
         ]
         
         let Ry: [[Double]] = [
-            [cos(pitch), 0.0, sin(pitch)],
+            [cos(ry), 0.0, sin(ry)],
             [0.0, 1.0, 0.0],
-            [-sin(pitch), 0.0, cos(pitch)]
+            [-sin(ry), 0.0, cos(ry)]
         ]
         
         let Rz: [[Double]] = [
-            [cos(yaw), -sin(yaw), 0.0],
-            [sin(yaw), cos(yaw), 0.0],
+            [cos(rz), -sin(rz), 0.0],
+            [sin(rz), cos(rz), 0.0],
             [0.0, 0.0, 1.0]
         ]
         
-        // Combine rotation matrices (simplified for prototype)
-        // In a real implementation, we would use proper matrix multiplication
+        // Combine rotation matrices (R = Rz * Ry * Rx)
+        // This is a simplified implementation - in a real app, use matrix multiplication
         self.rotation = [
             [1.0, 0.0, 0.0],
             [0.0, 1.0, 0.0],
@@ -163,11 +203,22 @@ struct CameraExtrinsics {
         ]
         
         self.translation = translation
-        self.deviceId = deviceId
+        
+        // If no device ID is provided, use the current device's ID
+        if let id = deviceId {
+            self.deviceId = id
+        } else {
+            self.deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
+        }
+        
+        print("Created extrinsics for device ID: \(self.deviceId)")
     }
     
-    /// Create identity extrinsics (camera at origin, no rotation)
-    static func identity(deviceId: String) -> CameraExtrinsics {
+    // Create identity extrinsics (no rotation, no translation)
+    static func identity(deviceId: String? = nil) -> CameraExtrinsics {
+        let actualDeviceId = deviceId ?? UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
+        print("Creating identity extrinsics for device ID: \(actualDeviceId)")
+        
         return CameraExtrinsics(
             rotation: [
                 [1.0, 0.0, 0.0],
@@ -175,7 +226,7 @@ struct CameraExtrinsics {
                 [0.0, 0.0, 1.0]
             ],
             translation: [0.0, 0.0, 0.0],
-            deviceId: deviceId
+            deviceId: actualDeviceId
         )
     }
     

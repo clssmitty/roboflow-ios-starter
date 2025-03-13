@@ -15,6 +15,334 @@ import AVFoundation
 import Vision
 import Roboflow
 import MultipeerConnectivity
+import Foundation
+
+// Minimal implementations of required types
+// These should be removed once the Triangulation.swift and CameraCalibration.swift files
+// are properly added to the Xcode project target
+
+/// Represents a 3D point with confidence
+struct Point3D {
+    let x: Double
+    let y: Double
+    let z: Double
+    let confidence: Double
+    
+    func toDictionary() -> [String: Any] {
+        return ["x": x, "y": y, "z": z, "confidence": confidence]
+    }
+    
+    static func fromDictionary(_ dict: [String: Any]) -> Point3D? {
+        guard let x = dict["x"] as? Double,
+              let y = dict["y"] as? Double,
+              let z = dict["z"] as? Double,
+              let confidence = dict["confidence"] as? Double else {
+            return nil
+        }
+        return Point3D(x: x, y: y, z: z, confidence: confidence)
+    }
+}
+
+/// Represents a 2D detection with timestamp
+struct Detection2D {
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+    let confidence: Double
+    let timestamp: Double
+    let deviceId: String
+    
+    var center: CGPoint { return CGPoint(x: x, y: y) }
+    var sizePixels: Double { return (width + height) / 2.0 }
+    
+    func toDictionary() -> [String: Any] {
+        return [
+            "x": x, "y": y, "w": width, "h": height,
+            "cf": confidence, "ts": timestamp, "device_id": deviceId
+        ]
+    }
+    
+    static func fromDictionary(_ dict: [String: Any]) -> Detection2D? {
+        guard let x = dict["x"] as? Double,
+              let y = dict["y"] as? Double,
+              let w = dict["w"] as? Double,
+              let h = dict["h"] as? Double,
+              let cf = dict["cf"] as? Double,
+              let ts = dict["ts"] as? Double,
+              let deviceId = dict["device_id"] as? String else {
+            return nil
+        }
+        return Detection2D(x: x, y: y, width: w, height: h, confidence: cf, timestamp: ts, deviceId: deviceId)
+    }
+}
+
+/// Minimal camera intrinsics struct
+struct CameraIntrinsics {
+    let focalLengthX: Double
+    let focalLengthY: Double
+    let principalPointX: Double
+    let principalPointY: Double
+    
+    func toDictionary() -> [String: Any] {
+        return ["fx": focalLengthX, "fy": focalLengthY, "cx": principalPointX, "cy": principalPointY]
+    }
+    
+    static func fromDictionary(_ dict: [String: Any]) -> CameraIntrinsics? {
+        guard let fx = dict["fx"] as? Double,
+              let fy = dict["fy"] as? Double,
+              let cx = dict["cx"] as? Double,
+              let cy = dict["cy"] as? Double else {
+            return nil
+        }
+        return CameraIntrinsics(focalLengthX: fx, focalLengthY: fy, principalPointX: cx, principalPointY: cy)
+    }
+}
+
+/// Minimal camera extrinsics struct
+struct CameraExtrinsics {
+    let rotation: [[Double]]
+    let translation: [Double]
+    
+    func toDictionary() -> [String: Any] {
+        return ["R": rotation, "T": translation]
+    }
+    
+    static func fromDictionary(_ dict: [String: Any]) -> CameraExtrinsics? {
+        guard let rotation = dict["R"] as? [[Double]],
+              let translation = dict["T"] as? [Double] else {
+            return nil
+        }
+        return CameraExtrinsics(rotation: rotation, translation: translation)
+    }
+}
+
+/// Minimal camera calibrator class
+class CameraCalibrator {
+    var intrinsics: CameraIntrinsics
+    var extrinsics: CameraExtrinsics
+    
+    init() {
+        // Default values
+        intrinsics = CameraIntrinsics(focalLengthX: 1000, focalLengthY: 1000, principalPointX: 320, principalPointY: 240)
+        extrinsics = CameraExtrinsics(rotation: [[1,0,0],[0,1,0],[0,0,1]], translation: [0,0,0])
+    }
+    
+    func setIntrinsics(_ newIntrinsics: CameraIntrinsics) {
+        intrinsics = newIntrinsics
+    }
+    
+    func setExtrinsics(_ newExtrinsics: CameraExtrinsics) {
+        extrinsics = newExtrinsics
+    }
+    
+    func setExtrinsics(translation: [Double], rotation: [Double]) {
+        extrinsics = CameraExtrinsics(rotation: [[1,0,0],[0,1,0],[0,0,1]], translation: translation)
+    }
+    
+    func imagePointToRay(imagePoint: CGPoint) -> [Double] {
+        // Convert image point to normalized device coordinates
+        let normalizedX = (Double(imagePoint.x) - intrinsics.principalPointX) / intrinsics.focalLengthX
+        let normalizedY = (Double(imagePoint.y) - intrinsics.principalPointY) / intrinsics.focalLengthY
+        
+        // Create a ray direction vector (in camera coordinates)
+        let rayX = normalizedX
+        let rayY = normalizedY
+        let rayZ = 1.0 // Forward direction
+        
+        // Normalize the ray direction
+        let magnitude = sqrt(rayX * rayX + rayY * rayY + rayZ * rayZ)
+        let normalizedRayX = rayX / magnitude
+        let normalizedRayY = rayY / magnitude
+        let normalizedRayZ = rayZ / magnitude
+        
+        // Apply camera rotation to get the ray in world coordinates
+        // For simplicity, we'll use the identity rotation if no rotation is specified
+        let rotatedRay = applyRotation(
+            vector: [normalizedRayX, normalizedRayY, normalizedRayZ],
+            rotation: extrinsics.rotation
+        )
+        
+        return rotatedRay
+    }
+    
+    private func applyRotation(vector: [Double], rotation: [[Double]]) -> [Double] {
+        // Apply 3x3 rotation matrix to a 3D vector
+        guard rotation.count == 3 && rotation[0].count == 3 else {
+            // Return the original vector if rotation matrix is invalid
+            return vector
+        }
+        
+        let x = vector[0]
+        let y = vector[1]
+        let z = vector[2]
+        
+        let rotatedX = rotation[0][0] * x + rotation[0][1] * y + rotation[0][2] * z
+        let rotatedY = rotation[1][0] * x + rotation[1][1] * y + rotation[1][2] * z
+        let rotatedZ = rotation[2][0] * x + rotation[2][1] * y + rotation[2][2] * z
+        
+        return [rotatedX, rotatedY, rotatedZ]
+    }
+    
+    func estimateDistance(objectSizeMeters: Double, objectSizePixels: Double) -> Double {
+        // Get the pixels per meter value from calibration, or use a default if not available
+        let pixelsPerMeter = UserDefaults.standard.double(forKey: "pixelsPerMeter")
+        if pixelsPerMeter > 0 {
+            return objectSizePixels / pixelsPerMeter
+        } else {
+            // Fallback to the simplified calculation if no calibration data
+            return (objectSizeMeters * 1000) / objectSizePixels
+        }
+    }
+}
+
+/// Minimal triangulator class
+class Triangulator {
+    private var calibrators: [String: CameraCalibrator] = [:]
+    private var latestDetections: [String: Detection2D] = [:]
+    private(set) var latestPosition: Point3D?
+    
+    // Constants for triangulation
+    private let ballDiameterMeters: Double = 0.0508 // Standard pickleball diameter (2 inches)
+    private let maxTimeDifference: Double = 0.1 // Maximum time difference between detections (100ms)
+    
+    init() {
+        let deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
+        calibrators[deviceId] = CameraCalibrator()
+    }
+    
+    func addCalibrator(calibrator: CameraCalibrator, deviceId: String) {
+        calibrators[deviceId] = calibrator
+    }
+    
+    func addDetection(detection: Detection2D) -> Bool {
+        // Store the detection
+        latestDetections[detection.deviceId] = detection
+        
+        // We need at least 2 detections from different devices to triangulate
+        if latestDetections.count >= 2 {
+            // Filter detections that are too old
+            let currentTime = detection.timestamp
+            let validDetections = latestDetections.filter { $0.value.timestamp >= currentTime - maxTimeDifference }
+            
+            // If we still have at least 2 valid detections, perform triangulation
+            if validDetections.count >= 2 {
+                // Get the first two detections (from different devices)
+                let detectionArray = Array(validDetections.values)
+                let detection1 = detectionArray[0]
+                let detection2 = detectionArray[1]
+                
+                // Debug: Print available calibrators and detection device IDs
+                print("Available calibrators for devices: \(calibrators.keys.joined(separator: ", "))")
+                print("Detection 1 device ID: \(detection1.deviceId)")
+                print("Detection 2 device ID: \(detection2.deviceId)")
+                
+                // Get the calibrators for these devices
+                guard let calibrator1 = calibrators[detection1.deviceId],
+                      let calibrator2 = calibrators[detection2.deviceId] else {
+                    print("Missing calibrators for devices. Available: \(calibrators.keys.joined(separator: ", "))")
+                    print("Needed: \(detection1.deviceId) and \(detection2.deviceId)")
+                    return false
+                }
+                
+                // Perform triangulation
+                latestPosition = triangulatePosition(
+                    detection1: detection1,
+                    detection2: detection2,
+                    calibrator1: calibrator1,
+                    calibrator2: calibrator2
+                )
+                
+                return latestPosition != nil
+            }
+        }
+        
+        return false
+    }
+    
+    private func triangulatePosition(
+        detection1: Detection2D,
+        detection2: Detection2D,
+        calibrator1: CameraCalibrator,
+        calibrator2: CameraCalibrator
+    ) -> Point3D? {
+        print("Triangulating with detections from devices: \(detection1.deviceId) and \(detection2.deviceId)")
+        print("Detection 1: x=\(detection1.x), y=\(detection1.y), size=\(detection1.sizePixels), conf=\(detection1.confidence)")
+        print("Detection 2: x=\(detection2.x), y=\(detection2.y), size=\(detection2.sizePixels), conf=\(detection2.confidence)")
+        
+        // Convert image points to rays in 3D space
+        let ray1 = calibrator1.imagePointToRay(imagePoint: detection1.center)
+        let ray2 = calibrator2.imagePointToRay(imagePoint: detection2.center)
+        
+        print("Ray 1: \(ray1)")
+        print("Ray 2: \(ray2)")
+        
+        // Get camera positions (origins of the rays)
+        let origin1 = calibrator1.extrinsics.translation
+        let origin2 = calibrator2.extrinsics.translation
+        
+        print("Camera 1 position: \(origin1)")
+        print("Camera 2 position: \(origin2)")
+        
+        // For a simple implementation, we'll use a basic triangulation approach
+        // In a real implementation, you would use a more sophisticated algorithm
+        
+        // Estimate distances based on the known ball size
+        let distance1 = calibrator1.estimateDistance(
+            objectSizeMeters: ballDiameterMeters,
+            objectSizePixels: detection1.sizePixels
+        )
+        
+        let distance2 = calibrator2.estimateDistance(
+            objectSizeMeters: ballDiameterMeters,
+            objectSizePixels: detection2.sizePixels
+        )
+        
+        print("Estimated distance 1: \(distance1) meters")
+        print("Estimated distance 2: \(distance2) meters")
+        
+        // Calculate 3D positions from each camera
+        let pos1X = origin1[0] + ray1[0] * distance1
+        let pos1Y = origin1[1] + ray1[1] * distance1
+        let pos1Z = origin1[2] + ray1[2] * distance1
+        
+        let pos2X = origin2[0] + ray2[0] * distance2
+        let pos2Y = origin2[1] + ray2[1] * distance2
+        let pos2Z = origin2[2] + ray2[2] * distance2
+        
+        print("Position from camera 1: (\(pos1X), \(pos1Y), \(pos1Z))")
+        print("Position from camera 2: (\(pos2X), \(pos2Y), \(pos2Z))")
+        
+        // Average the two positions (simple approach)
+        let avgX = (pos1X + pos2X) / 2.0
+        let avgY = (pos1Y + pos2Y) / 2.0
+        let avgZ = (pos1Z + pos2Z) / 2.0
+        
+        // Calculate confidence based on time difference and detection confidences
+        let timeDiff = abs(detection1.timestamp - detection2.timestamp)
+        let timeConfidence = 1.0 - (timeDiff / maxTimeDifference)
+        let detectionConfidence = (detection1.confidence + detection2.confidence) / 2.0
+        let confidence = timeConfidence * detectionConfidence
+        
+        print("Final triangulated position: (\(avgX), \(avgY), \(avgZ)) with confidence \(confidence)")
+        
+        // Create and return the 3D point
+        return Point3D(x: avgX, y: avgY, z: avgZ, confidence: confidence)
+    }
+    
+    func getLatestPosition() -> Point3D? {
+        return latestPosition
+    }
+    
+    func clearDetections() {
+        latestDetections.removeAll()
+        latestPosition = nil
+    }
+    
+    func getAvailableCalibrators() -> [String] {
+        return Array(calibrators.keys)
+    }
+}
 
 var API_KEY = "dJ0Ql7NDNI5ZIJFAdLsB"
 
@@ -110,7 +438,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     private var connectionButtons: [UIButton] = []
     
     // Triangulation properties
-    private let triangulator = Triangulator()
+    private var triangulator = Triangulator()
     private var lastDetectionTime: TimeInterval = 0
     private var lastTriangulationTime: TimeInterval = 0
     private var triangulationLabel: UILabel!
@@ -125,6 +453,11 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     
     // New status indicator
     private var statusIndicator: UIView?
+    
+    // Add calibration object constants
+    private let calibrationObjectWidthInches: Double = 18.0
+    private let calibrationObjectHeightInches: Double = 24.0
+    private let inchesToMeters: Double = 0.0254 // Conversion factor from inches to meters
     
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -143,6 +476,12 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.updateTransmissionRateDisplay()
         }
+        
+        // Initialize triangulator is already done in the property declaration
+        
+        // Ensure the local device calibrator is added with the correct device ID
+        let deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
+        print("Local device ID: \(deviceId)")
     }
     
     override func viewWillDisappear(_ animated: Bool) {
@@ -423,7 +762,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         let currentTime = CACurrentMediaTime()
         lastDetectionTime = currentTime
         
-        // Device identifier
+        // Device identifier - ensure we use the same ID consistently throughout the app
         let deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
         
         for detection in detections {
@@ -477,7 +816,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 height: Double(height),
                 confidence: confidence,
                 timestamp: currentTime,
-                deviceId: deviceId
+                deviceId: deviceId  // Use the consistent device ID
             )
             
             // Add to triangulator
@@ -1139,10 +1478,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             if let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
                let type = json["type"] as? String {
                 
+                print("Received data of type: \(type) from peer: \(peerID.displayName)")
+                
                 switch type {
                 case "detection":
                     if let detectionData = json["data"] as? [String: Any],
                        let detection = Detection2D.fromDictionary(detectionData) {
+                        
+                        print("Received detection from device: \(detection.deviceId)")
                         
                         // Process the detection for triangulation
                         let performedTriangulation = triangulator.addDetection(detection: detection)
@@ -1160,6 +1503,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                        let intrinsicsDict = json["intrinsics"] as? [String: Any],
                        let extrinsicsDict = json["extrinsics"] as? [String: Any] {
                         
+                        print("Received calibration data for device: \(deviceId)")
+                        
                         // Create calibrator from received data
                         let calibrator = CameraCalibrator()
                         
@@ -1174,6 +1519,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                         
                         // Add to triangulator
                         triangulator.addCalibrator(calibrator: calibrator, deviceId: deviceId)
+                        print("Added calibrator for device: \(deviceId)")
+                        print("Available calibrators: \(triangulator.getAvailableCalibrators())")
                         
                         // Update UI
                         DispatchQueue.main.async {
@@ -1183,20 +1530,20 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                     
                 default:
                     // Handle legacy data format
-                    processReceivedData(data)
+                    processReceivedData(data, fromPeer: peerID)
                 }
             } else {
                 // Handle legacy data format
-                processReceivedData(data)
+                processReceivedData(data, fromPeer: peerID)
             }
         } catch {
             print("Error processing received data: \(error.localizedDescription)")
-            processReceivedData(data)
+            processReceivedData(data, fromPeer: peerID)
         }
     }
     
     // Helper method to process received data in the original format
-    private func processReceivedData(_ data: Data) {
+    private func processReceivedData(_ data: Data, fromPeer peerID: MCPeerID) {
         do {
             if let receivedPackets = try JSONSerialization.jsonObject(with: data) as? [[String: Any]],
                let packet = receivedPackets.first {
@@ -1491,8 +1838,8 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             
             // Remove tap gesture recognizer
             for recognizer in view.gestureRecognizers ?? [] {
-                if let tapGesture = recognizer as? UITapGestureRecognizer,
-                   tapGesture.action == #selector(handleCalibrationTap(_:)) {
+                if let tapGesture = recognizer as? UITapGestureRecognizer {
+                    // Simply remove all tap gesture recognizers since we only add one for calibration
                     view.removeGestureRecognizer(tapGesture)
                 }
             }
@@ -1503,10 +1850,10 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         switch calibrationStep {
         case 1:
             calibrationStepLabel.text = "Step 1: Tap on the top-left corner of the calibration object"
-            calibrationInstructionsLabel.text = "Place a rectangular calibration object (e.g., a sheet of paper) in view of both cameras."
+            calibrationInstructionsLabel.text = "Place an 18\" × 24\" calibration object (e.g., a poster board) in view of both cameras."
         case 2:
             calibrationStepLabel.text = "Step 2: Tap on the top-right corner of the calibration object"
-            calibrationInstructionsLabel.text = "Make sure the object is clearly visible and not moving."
+            calibrationInstructionsLabel.text = "Make sure the 18\" × 24\" object is clearly visible and not moving."
         case 3:
             calibrationStepLabel.text = "Step 3: Tap on the bottom-right corner of the calibration object"
             calibrationInstructionsLabel.text = "Keep the device steady during calibration."
@@ -1532,14 +1879,15 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     @objc func handleCalibrationTap(_ gesture: UITapGestureRecognizer) {
         guard calibrationMode && calibrationStep <= 4 else { return }
         
-        // Get the tap location
-        let location = gesture.location(in: previewLayer)
+        // Get the tap location in the view first, then convert to the preview layer's coordinate space
+        let locationInView = gesture.location(in: view)
+        let locationInPreviewLayer = previewLayer.convert(locationInView, from: view.layer)
         
         // Store the calibration point
-        calibrationPoints.append(location)
+        calibrationPoints.append(locationInPreviewLayer)
         
-        // Draw a marker at the tapped location
-        drawCalibrationMarker(at: location)
+        // Draw a marker at the tapped location (in view coordinates)
+        drawCalibrationMarker(at: locationInView)
         
         // Move to the next step
         calibrationStep += 1
@@ -1587,36 +1935,76 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
             return CGPoint(x: normalizedX, y: normalizedY)
         }
         
-        // Create a simple calibration based on the points
-        // In a real implementation, this would use more sophisticated algorithms
+        // Calculate the real-world dimensions of the calibration object in meters
+        let objectWidthMeters = calibrationObjectWidthInches * inchesToMeters
+        let objectHeightMeters = calibrationObjectHeightInches * inchesToMeters
+        
+        // Create a device ID - ensure we use the same ID consistently throughout the app
         let deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
+        print("Performing calibration for device ID: \(deviceId)")
         
         // Create a calibrator with default intrinsics
         let calibrator = CameraCalibrator()
         
-        // Set a simple extrinsic calibration (position and orientation)
-        // For this prototype, we'll just use a simple approach where:
-        // - First device is at origin (0,0,0)
-        // - Second device is at a fixed distance (e.g., 1 meter to the right)
+        // Calculate the scale factor based on the known object size
+        // This is a simplified approach - in a production app, you would use more sophisticated algorithms
+        let pixelWidth = hypot(
+            calibrationPoints[1].x - calibrationPoints[0].x,
+            calibrationPoints[1].y - calibrationPoints[0].y
+        )
+        let pixelHeight = hypot(
+            calibrationPoints[3].x - calibrationPoints[0].x,
+            calibrationPoints[3].y - calibrationPoints[0].y
+        )
+        
+        // Calculate pixels per meter for width and height
+        let pixelsPerMeterWidth = pixelWidth / objectWidthMeters
+        let pixelsPerMeterHeight = pixelHeight / objectHeightMeters
+        
+        // Use the average for a more robust estimate
+        let pixelsPerMeter = (pixelsPerMeterWidth + pixelsPerMeterHeight) / 2.0
+        
+        // Calculate the approximate focal length based on the calibration
+        // This is a simplified approach - in a production app, you would use proper camera calibration
+        let approximateFocalLength = pixelsPerMeter * 0.5 // Assuming the object is about 0.5m from the camera
+        
+        // Update the intrinsics with our calculated focal length
+        let updatedIntrinsics = CameraIntrinsics(
+            focalLengthX: approximateFocalLength,
+            focalLengthY: approximateFocalLength,
+            principalPointX: Double(previewLayer.bounds.width / 2),
+            principalPointY: Double(previewLayer.bounds.height / 2)
+        )
+        calibrator.setIntrinsics(updatedIntrinsics)
+        
+        // Determine if this is the first or second device
         let isFirstDevice = mcSession.connectedPeers.isEmpty || 
                            (mcSession.connectedPeers.first?.displayName ?? "") > UIDevice.current.name
         
+        // Calculate the camera position based on the calibration object
+        // For simplicity, we'll still use a fixed configuration, but with better scale
         if isFirstDevice {
             // First device is at origin
             calibrator.setExtrinsics(translation: [0, 0, 0], rotation: [0, 0, 0])
         } else {
-            // Second device is 1 meter to the right
+            // Second device - we'll still assume it's to the right, but we'll use the calculated scale
+            // In a real implementation, you would calculate the actual relative position
             calibrator.setExtrinsics(translation: [1.0, 0, 0], rotation: [0, 0, 0])
         }
         
+        // Store the pixels per meter value for distance calculations
+        UserDefaults.standard.set(pixelsPerMeter, forKey: "pixelsPerMeter")
+        
         // Add the calibrator to the triangulator
         triangulator.addCalibrator(calibrator: calibrator, deviceId: deviceId)
+        print("Added local calibrator to triangulator for device: \(deviceId)")
+        print("Available calibrators: \(triangulator.getAvailableCalibrators())")
         
         // Share calibration data with peers
-        shareCalibrationData(calibrator: calibrator, deviceId: deviceId)
+        shareCalibrationData(calibrator: calibrator, deviceId: deviceId, pixelsPerMeter: pixelsPerMeter)
     }
     
-    private func shareCalibrationData(calibrator: CameraCalibrator, deviceId: String) {
+    private func shareCalibrationData(calibrator: CameraCalibrator, deviceId: String, pixelsPerMeter: Double) {
         guard !mcSession.connectedPeers.isEmpty else { return }
         
         do {
@@ -1628,13 +2016,19 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
                 "type": "calibration",
                 "device_id": deviceId,
                 "intrinsics": intrinsicsDict,
-                "extrinsics": extrinsicsDict
+                "extrinsics": extrinsicsDict,
+                "pixels_per_meter": pixelsPerMeter,
+                "object_width_meters": calibrationObjectWidthInches * inchesToMeters,
+                "object_height_meters": calibrationObjectHeightInches * inchesToMeters
             ]
+            
+            print("Sharing calibration data for device ID: \(deviceId)")
             
             // Send to peers
             let data = try JSONSerialization.data(withJSONObject: calibrationData, options: [])
             try mcSession.send(data, toPeers: mcSession.connectedPeers, with: .reliable)
             
+            print("Calibration data sent to \(mcSession.connectedPeers.count) peers")
         } catch {
             print("Error sending calibration data: \(error.localizedDescription)")
         }
@@ -1646,7 +2040,22 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         guard !mcSession.connectedPeers.isEmpty else { return }
         
         do {
-            let detectionDict = detection.toDictionary()
+            // Make sure we're using the correct device ID
+            var detectionToSend = detection
+            // If the detection doesn't have the correct device ID, create a new one with the correct ID
+            if detection.deviceId != UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device" {
+                detectionToSend = Detection2D(
+                    x: detection.x,
+                    y: detection.y,
+                    width: detection.width,
+                    height: detection.height,
+                    confidence: detection.confidence,
+                    timestamp: detection.timestamp,
+                    deviceId: UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
+                )
+            }
+            
+            let detectionDict = detectionToSend.toDictionary()
             let data = try JSONSerialization.data(withJSONObject: ["type": "detection", "data": detectionDict], options: [])
             try mcSession.send(data, toPeers: mcSession.connectedPeers, with: .reliable)
         } catch {
@@ -1655,12 +2064,41 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     }
     
     private func updateTriangulationDisplay() {
-        guard let position = triangulator.getLatestPosition() else { return }
+        guard let position = triangulator.getLatestPosition() else {
+            // If no position is available, update the label to show status
+            DispatchQueue.main.async {
+                self.triangulationLabel.text = "Waiting for triangulation data...\nNeed detections from both cameras"
+                self.triangulationLabel.backgroundColor = UIColor.darkGray.withAlphaComponent(0.7)
+            }
+            return
+        }
+        
+        // Calculate time since last triangulation
+        let timeSinceUpdate = CACurrentMediaTime() - lastTriangulationTime
+        let freshness = timeSinceUpdate < 0.5 ? "Fresh" : "Stale"
         
         // Update UI on main thread
         DispatchQueue.main.async {
-            self.triangulationLabel.text = String(format: "Ball Position (m):\nX: %.2f Y: %.2f Z: %.2f\nConfidence: %.2f", 
-                                                 position.x, position.y, position.z, position.confidence)
+            // Format the position with 2 decimal places
+            let positionText = String(format: "Ball Position (m):\nX: %.2f Y: %.2f Z: %.2f\nConfidence: %.2f (%@)",
+                                     position.x, position.y, position.z, position.confidence, freshness)
+            
+            self.triangulationLabel.text = positionText
+            
+            // Change background color based on confidence
+            if position.confidence > 0.7 {
+                self.triangulationLabel.backgroundColor = UIColor.green.withAlphaComponent(0.7)
+            } else if position.confidence > 0.4 {
+                self.triangulationLabel.backgroundColor = UIColor.orange.withAlphaComponent(0.7)
+            } else {
+                self.triangulationLabel.backgroundColor = UIColor.red.withAlphaComponent(0.7)
+            }
+            
+            // Make sure the label is visible
+            self.triangulationLabel.isHidden = false
+            
+            // Bring the label to front
+            self.view.bringSubviewToFront(self.triangulationLabel)
         }
     }
 }

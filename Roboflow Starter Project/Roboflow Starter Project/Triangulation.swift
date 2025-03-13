@@ -121,6 +121,7 @@ class Triangulator {
         let localCalibrator = CameraCalibrator()
         let deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
         calibrators[deviceId] = localCalibrator
+        print("Triangulator initialized with local device ID: \(deviceId)")
     }
     
     /// Add a camera calibrator for a device
@@ -129,6 +130,13 @@ class Triangulator {
     ///   - deviceId: The device identifier
     func addCalibrator(calibrator: CameraCalibrator, deviceId: String) {
         calibrators[deviceId] = calibrator
+        print("Added calibrator for device: \(deviceId)")
+    }
+    
+    /// Get a list of device IDs for which we have calibrators
+    /// - Returns: Array of device IDs
+    func getAvailableCalibrators() -> [String] {
+        return Array(calibrators.keys)
     }
     
     /// Add a detection from a device
